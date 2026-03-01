@@ -8,7 +8,14 @@ import re
 import platform
 import glob
 
-app = FastAPI(title="AKASHA Downloader API Pro", version="1.4")
+# =========================================================================
+# ESCUDO ANTI-BLOQUEOS: Auto-actualiza el motor cada vez que el servidor despierta
+# para evadir la seguridad diaria de YouTube e Instagram.
+# =========================================================================
+print("Actualizando yt-dlp para evadir bloqueos...")
+os.system("python -m pip install -U yt-dlp")
+
+app = FastAPI(title="AKASHA Downloader API Pro", version="1.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,20 +48,19 @@ def ejecutar_ytdlp(req: DescargarRequest):
     ruta_real = asegurar_directorio()
     
     yt_dlp_path = "yt-dlp"
-    
-    # TRUCO 1: Nombramos el archivo SOLO con su ID para que no se pierda jamás.
     plantilla_nombre = f"{req.id_video}.%(ext)s"
     
     comando = [
         yt_dlp_path, 
         "--newline", 
         "--no-colors", 
+        "--no-warnings",
+        "--force-ipv4", # TRUCO VITAL: Fuerza la conexión como un usuario normal para evitar que la IP de Render sea congelada.
         "-P", ruta_real, 
         "-o", plantilla_nombre
     ]
     
-    # TRUCO 2 (LA SALVACIÓN): Obligamos a descargar archivos pre-ensamblados. 
-    # Esto evita usar FFmpeg y evita que Render se quede sin memoria RAM y mate el archivo.
+    # Se descargan formatos pre-ensamblados para que la memoria RAM de Render no colapse
     if "Audio" in req.formato:
         comando.extend(["-f", "bestaudio", "-x", "--audio-format", "mp3"])
     else:
@@ -78,10 +84,12 @@ def ejecutar_ytdlp(req: DescargarRequest):
                 else:
                     progresos_descarga[req.id_video] = progreso
                 
-        process.wait()
+        # Le damos un tiempo máximo de 10 minutos para evitar que el servidor se quede trabado para siempre
+        process.wait(timeout=600)
         progresos_descarga[req.id_video] = 100.0 if process.returncode == 0 else -1.0
             
-    except Exception:
+    except Exception as e:
+        print(f"Error fatal: {str(e)}")
         progresos_descarga[req.id_video] = -1.0
     finally:
         if req.id_video in procesos_activos:
@@ -99,17 +107,18 @@ async def obtener_progreso(id_video: str):
 @app.get("/api/cancelar/{id_video}")
 async def cancelar_descarga(id_video: str):
     process = procesos_activos.get(id_video)
-    if process: process.kill()
+    if process: 
+        process.kill()
+    progresos_descarga[id_video] = -1.0
     return {"estado": "cancelado"}
 
 @app.get("/api/obtener_archivo/{id_video}")
 def obtener_archivo(id_video: str):
     ruta_real = asegurar_directorio()
-    # Busca exactamente el archivo con el ID
     archivos_encontrados = glob.glob(os.path.join(ruta_real, f"{id_video}.*"))
     
     if not archivos_encontrados:
-        raise HTTPException(status_code=404, detail="Archivo no encontrado por limite de memoria RAM en Render.")
+        raise HTTPException(status_code=404, detail="Archivo no encontrado en el servidor.")
         
     archivo_ruta = archivos_encontrados[0]
     extension = archivo_ruta.split('.')[-1]
@@ -120,3 +129,7 @@ def obtener_archivo(id_video: str):
         filename=nombre_limpio, 
         media_type="application/octet-stream"
     )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
