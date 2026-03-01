@@ -8,7 +8,7 @@ import re
 import platform
 import glob
 
-app = FastAPI(title="AKASHA Downloader API Pro", version="1.2")
+app = FastAPI(title="AKASHA Downloader API Pro", version="1.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,34 +30,20 @@ class DescargarRequest(BaseModel):
     subtitulos: bool
     calidad: str
 
-class DatosCarpeta(BaseModel):
-    ruta: str
-
-def asegurar_directorio(ruta_pedida: str) -> str:
-    sistema_actual = platform.system()
-    if sistema_actual != "Windows":
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        ruta_final = os.path.join(base_dir, "downloads")
-    else:
-        ruta_final = ruta_pedida.replace("/", "\\")
-
-    try:
-        os.makedirs(ruta_final, exist_ok=True)
-        return ruta_final
-    except Exception:
-        fallback = os.path.join(os.getcwd(), "downloads")
-        os.makedirs(fallback, exist_ok=True)
-        return fallback
+def asegurar_directorio():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ruta_final = os.path.join(base_dir, "downloads")
+    os.makedirs(ruta_final, exist_ok=True)
+    return ruta_final
 
 def ejecutar_ytdlp(req: DescargarRequest):
     progresos_descarga[req.id_video] = 1.0 
-    ruta_real = asegurar_directorio(req.ruta_base)
+    ruta_real = asegurar_directorio()
     
     yt_dlp_path = "yt-dlp"
-    if platform.system() == "Windows" and os.path.exists("yt-dlp.exe"):
-        yt_dlp_path = os.path.abspath("yt-dlp.exe")
     
-    plantilla_nombre = f"%(title)s_{req.id_video}.%(ext)s"
+    # TRUCO 1: Nombramos el archivo SOLO con su ID para que no se pierda jamás.
+    plantilla_nombre = f"{req.id_video}.%(ext)s"
     
     comando = [
         yt_dlp_path, 
@@ -67,24 +53,12 @@ def ejecutar_ytdlp(req: DescargarRequest):
         "-o", plantilla_nombre
     ]
     
-    if "1080p" in req.calidad:
-        comando.extend(["-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]"])
-    elif "720p" in req.calidad:
-        comando.extend(["-f", "bestvideo[height<=720]+bestaudio/best[height<=720]"])
-        
+    # TRUCO 2 (LA SALVACIÓN): Obligamos a descargar archivos pre-ensamblados. 
+    # Esto evita usar FFmpeg y evita que Render se quede sin memoria RAM y mate el archivo.
     if "Audio" in req.formato:
-        ext = "mp3" if "MP3" in req.formato else "wav"
-        comando.extend(["-x", "--audio-format", ext])
-    elif "Original" not in req.formato:
-        if "MP4" in req.formato: comando.extend(["--merge-output-format", "mp4"])
-        if "MKV" in req.formato: comando.extend(["--merge-output-format", "mkv"])
-        
-    if "MB/s" in req.limite_velocidad:
-        vel = req.limite_velocidad.replace(" ", "")
-        comando.extend(["--limit-rate", vel])
-        
-    if req.subtitulos:
-        comando.extend(["--write-subs", "--embed-subs"])
+        comando.extend(["-f", "bestaudio", "-x", "--audio-format", "mp3"])
+    else:
+        comando.extend(["-f", "best[ext=mp4]/best"]) 
         
     comando.append(req.url)
     
@@ -99,17 +73,12 @@ def ejecutar_ytdlp(req: DescargarRequest):
             match = re.search(r'\[download\]\s+(\d+(?:\.\d+)?)%', line)
             if match:
                 progreso = float(match.group(1))
-                # LA MAGIA Y SOLUCIÓN: Congelamos el progreso máximo en 99%
-                # El usuario verá 99% mientras el servidor "pega" el video y el audio.
                 if progreso >= 99.0:
                     progresos_descarga[req.id_video] = 99.0
-                elif progreso > progresos_descarga.get(req.id_video, 0):
+                else:
                     progresos_descarga[req.id_video] = progreso
                 
         process.wait()
-        
-        # AHORA SÍ: El proceso terminó totalmente. El archivo físico 100% real existe.
-        # Le enviamos el 100% a la aplicación web.
         progresos_descarga[req.id_video] = 100.0 if process.returncode == 0 else -1.0
             
     except Exception:
@@ -135,35 +104,19 @@ async def cancelar_descarga(id_video: str):
 
 @app.get("/api/obtener_archivo/{id_video}")
 def obtener_archivo(id_video: str):
-    ruta_real = asegurar_directorio("")
-    archivos_encontrados = glob.glob(os.path.join(ruta_real, f"*_{id_video}.*"))
+    ruta_real = asegurar_directorio()
+    # Busca exactamente el archivo con el ID
+    archivos_encontrados = glob.glob(os.path.join(ruta_real, f"{id_video}.*"))
     
     if not archivos_encontrados:
-        raise HTTPException(status_code=404, detail="Archivo no encontrado")
+        raise HTTPException(status_code=404, detail="Archivo no encontrado por limite de memoria RAM en Render.")
         
     archivo_ruta = archivos_encontrados[0]
-    nombre_original = os.path.basename(archivo_ruta)
-    nombre_limpio = nombre_original.replace(f"_{id_video}", "")
+    extension = archivo_ruta.split('.')[-1]
+    nombre_limpio = f"Akasha_Media_Download.{extension}"
     
     return FileResponse(
         path=archivo_ruta, 
         filename=nombre_limpio, 
         media_type="application/octet-stream"
     )
-
-@app.get("/api/explorar")
-def explorar_carpeta():
-    if platform.system() != "Windows":
-        return {"ruta": "Almacenamiento Interno (Nube)"}
-    return {"ruta": "C:\\Downloads\\AKASHA"}
-
-@app.post("/api/abrir_carpeta")
-def abrir_carpeta(datos: DatosCarpeta):
-    if platform.system() == "Windows":
-        os.startfile(asegurar_directorio(datos.ruta))
-        return {"status": "ok"}
-    raise HTTPException(status_code=400, detail="Mobile")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
